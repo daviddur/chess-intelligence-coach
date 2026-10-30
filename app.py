@@ -185,7 +185,7 @@ with concept_review:
             board=b,
             orientation=chess.WHITE if position["color"] == "White" else chess.BLACK,
             size=490, coordinates=True,
-        ).encode("utf-8"), use_container_width=True)
+        ), use_container_width=True)
         st.caption(f"Position from game {position['game']} · {position['stage']}. Engine answer hidden until your reflection is submitted.")
         with st.expander("Your position-reading checklist", expanded=True):
             for question in prompts_for_stage(position["stage"]):
@@ -273,7 +273,7 @@ with training:
     with left:
         drawing = chess.svg.board(board=board, orientation=chess.WHITE if selected["color"] == "White" else chess.BLACK,
                                   size=460, coordinates=True)
-        st.image(drawing.encode("utf-8"), use_container_width=True)
+        st.image(drawing, use_container_width=True)
     with right:
         st.markdown(f"**Game {selected['game']} · {selected['color']} to play · move {selected['move_number']}**")
         st.markdown(f"**Category:** {selected['theme']}")
