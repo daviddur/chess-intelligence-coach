@@ -18,7 +18,8 @@ from concept_coach import candidate_review, stage_questions, ai_explain
 from game_coach import (replay, chapters, board_lenses, change_after_move,
                         FOUNDATIONS, engine_checkpoint, ai_game_lesson, teaching_context,
                         chapter_engine_evidence, ai_full_game_story)
-from analysis import phase
+from analysis import phase, motifs_for_move
+from diagnosis import investigate
 
 
 def setting_from_secrets(name: str) -> str:
@@ -137,6 +138,7 @@ if go:
                     report = scan_games(games, username.strip(), engine_path, think_time, threshold, progress)
                 st.session_state.report = report
                 st.session_state.games_pgn = pgn
+                st.session_state.pop("diagnosis_update_notice", None)
                 for cache_key in ("game_coach_reflections", "game_coach_engine",
                                   "game_coach_lessons", "game_coach_chats", "game_coach_stories"):
                     st.session_state.pop(cache_key, None)
@@ -151,33 +153,109 @@ if report is None:
     st.markdown("### What it does")
     a, b, c = st.columns(3)
     a.markdown("**1. Read your games**\n\nFetch Chess.com or Lichess history, or upload PGN.")
-    b.markdown("**2. Discover repeated errors**\n\nFind engine-confirmed mistakes and likely forks, pins, skewers, mating ideas and loose pieces.")
+    b.markdown("**2. Discover repeated errors**\n\nScreen costly moves with Stockfish, then test tactical motifs and positional hypotheses.")
     c.markdown("**3. Train your blind spots**\n\nReview the exact positions where you missed a better move.")
     st.info("This version runs real analysis after you supply your own username or PGN. It does not generate fictitious ratings or weakness statistics.")
     st.stop()
 
-findings = report["findings"]
+all_findings = report["findings"]
+# A deeper search can overturn a short first-pass evaluation. Do not present
+# such positions as mistakes, practice exercises or strategic weaknesses.
+findings = [f for f in all_findings if f.get("confidence") != "Revised"]
+revised_count = len(all_findings) - len(findings)
 st.markdown(f"#### Analysis for **{st.session_state.get('report_username', '')}**")
 a, b, c, d = st.columns(4)
 a.metric("Games examined", report["games"])
 b.metric("Your moves examined", report["positions"])
-c.metric("Meaningful evaluation losses", len(findings))
-d.metric("Motif-tagged errors", sum(f["theme"] != "Other evaluation losses" for f in findings))
+c.metric("Screened mistakes", len(findings))
+d.metric("Unresolved cases", sum(f.get("confidence") == "Unresolved" for f in findings))
 
 if not findings:
-    st.success("No position exceeded your chosen loss threshold. Try a lower threshold or more games.")
+    st.success("No significant mistakes are currently confirmed in this sample. Try more games or a longer engine check.")
+    if revised_count:
+        st.caption(f"{revised_count} fast-pass mistake(s) were overturned by deeper analysis.")
     st.stop()
 
 df = pd.DataFrame(findings)
 summary, game_walkthrough, concept_review, training, all_positions = st.tabs(["Weakness profile", "Whole-game coach", "Understand a position", "Tactic practice", "All findings"])
 
 with summary:
-    st.subheader("Most frequent error categories")
-    st.caption("These counts are engine-confirmed evaluation losses classified by simple motif rules. Uncertain cases are shown as 'Other evaluation losses'.")
-    counts = df.groupby("theme").size().sort_values(ascending=False)
-    st.bar_chart(counts.rename("Errors"), horizontal=True)
+    st.subheader("What your evaluation losses may be teaching you")
+    st.caption("Fast Stockfish analysis screens costly decisions; this is not a definitive list of mistakes. Labels distinguish direct evidence from possible strategic clues. A motif's geometry does NOT prove why the move was bad.")
+    diagnostic_counts = df["confidence"].value_counts()
+    cols = st.columns(3)
+    cols[0].metric("Supported consequences", int(diagnostic_counts.get("Supported", 0)))
+    cols[1].metric("Strategic / tactical hypotheses", int(diagnostic_counts.get("Candidate", 0)))
+    cols[2].metric("Needs deeper investigation", int(diagnostic_counts.get("Unresolved", 0)))
+    if revised_count:
+        st.info(f"{revised_count} first-pass mistake(s) were **not confirmed by deeper engine analysis** and have been removed from the weakness profile and practice queue.")
+
+    explained = df[df["confidence"].isin(["Supported", "Candidate"])]
+    if not explained.empty:
+        counts = explained.groupby("theme").size().sort_values(ascending=False)
+        st.markdown("##### Working learning themes")
+        st.bar_chart(counts.rename("Occurrences"), horizontal=True)
+        st.caption("Supported consequences and tentative hypotheses are combined here for exploration—not treated as proven, independent weaknesses.")
+    else:
+        counts = pd.Series(dtype=int)
+        st.info("No explanations were supported by the first pass. Try deeper investigation below rather than assuming a specific chess weakness.")
+
+    with st.expander("🔎 Investigate inconclusive decisions with deeper Stockfish analysis", expanded=bool(diagnostic_counts.get("Unresolved", 0))):
+        st.markdown("**An unexplained engine drop isn't a diagnosis.** Reanalyse the actual position and its continuation at a slower engine setting, then inspect concrete evidence or retain an explicit unknown.")
+        unresolved = sorted((i for i, f in enumerate(findings) if f.get("confidence") == "Unresolved"),
+                            key=lambda ix: bool(findings[ix].get("rechecked")))
+        if unresolved:
+            st.write(f"{len(unresolved)} unresolved positions currently in this analysis.")
+            chosen = st.selectbox(
+                "Choose a position to investigate", unresolved,
+                format_func=lambda ix: (f"Game {findings[ix]['game']}, move {findings[ix]['move_number']}, "
+                                        f"{findings[ix]['color']}: {findings[ix]['played']} "
+                                        f"({findings[ix]['loss_cp']} cp)"),
+            )
+            batch_n = st.select_slider("Positions to recheck", options=[1, 5, 10, 20], value=5,
+                                       help="Each position gets a deeper search both before and after your move. Start with 5 to avoid long cloud computations.")
+            seconds = st.select_slider("Seconds per side of the decision", options=[0.5, 1.0, 1.5, 2.0], value=1.5)
+            c_single, c_batch = st.columns(2)
+            recheck_one = c_single.button("Recheck selected position", use_container_width=True)
+            recheck_batch = c_batch.button("Recheck unresolved batch", use_container_width=True)
+            if recheck_one or recheck_batch:
+                targets = [chosen] if recheck_one else unresolved[:batch_n]
+                done = 0
+                progress_bar = st.progress(0, text="Checking deeper engine lines…")
+                for n, ix in enumerate(targets, 1):
+                    try:
+                        new_result = investigate(findings[ix], engine_path, seconds=seconds,
+                                                 threshold_cp=report.get("threshold_cp", 135),
+                                                 motif_detector=motifs_for_move, phase_detector=phase)
+                        findings[ix].update(new_result)
+                        findings[ix]["rechecked"] = True
+                        done += 1
+                    except Exception as exc:
+                        st.warning(f"Game {findings[ix]['game']}, move {findings[ix]['move_number']}: {exc}")
+                    progress_bar.progress(n/len(targets), text=f"Rechecked {n}/{len(targets)} positions")
+                st.session_state.diagnosis_update_notice = f"Rechecked {done}/{len(targets)} positions with deeper engine search. Some may correctly remain unresolved."
+                st.rerun()
+        else:
+            st.success("No unresolved cases remain in the current results. The candidate labels still require interpretation before being considered proven weaknesses.")
+
+    if st.session_state.get("diagnosis_update_notice"):
+        st.info(st.session_state.pop("diagnosis_update_notice"))
+
+    with st.expander("Inspect the reason and evidence for any classified move"):
+        selected_index = st.selectbox("Decision", list(range(len(findings))),
+                                     format_func=lambda i: (f"Game {findings[i]['game']} · move {findings[i]['move_number']} "
+                                                            f"· {findings[i]['theme']}"), key="inspect_classification")
+        selected_finding = findings[selected_index]
+        st.markdown(f"**{selected_finding['theme']}** · {selected_finding.get('confidence', 'Unrated')} evidence")
+        st.write(selected_finding['explanation'])
+        for signal in selected_finding.get("evidence", []):
+            st.markdown("- " + signal)
+        st.markdown("**Question to investigate:** " + selected_finding.get("question", "Compare the tactical variations."))
+        st.caption("Engine best line: " + selected_finding.get("principal_variation", ""))
+        st.caption("After your move: " + selected_finding.get("punishment_line", ""))
+
     st.markdown("##### Tactical opportunities recognised by the first-pass detector")
-    st.caption("An opportunity here means Stockfish's best move had a detectable geometric motif. It's an estimate, not a definitive measure of every possible tactic.")
+    st.caption("Detected geometries in the fast engine's chosen moves, not confirmed tactical wins; the percentages are screening indicators only.")
     opportunities = report.get("motif_events", {})
     missed = report.get("motif_missed", {})
     if opportunities:
@@ -196,8 +274,9 @@ with summary:
     with col2:
         st.markdown("##### Mistake severity")
         st.bar_chart(df.groupby("severity").size().rename("Errors"))
-    top = counts.index[0]
-    st.info(f"**Your most frequent detected category:** {top} ({counts.iloc[0]} occurrences). Start with those training positions.")
+    if not counts.empty:
+        top = counts.index[0]
+        st.info(f"**Most common learning hypothesis:** {top} ({counts.iloc[0]} occurrences). Review the evidence before treating it as a confirmed weakness.")
 
 with game_walkthrough:
     st.subheader("Learn the entire game — not just isolated mistakes")
@@ -605,7 +684,7 @@ with concept_review:
                         st.caption(alternative["continuation"])
                     st.write("After your proposed move: " + chosen["continuation"])
                     st.write("After your original move: " + original["continuation"])
-                    st.caption("Tactical motif detector: " + position["theme"] + ". " + position["explanation"])
+                    st.caption("Screening category (" + position.get("confidence", "unrated") + "): " + position["theme"] + ". " + position["explanation"])
 
                 api_key = setting_from_secrets("OPENAI_API_KEY")
                 access_code = setting_from_secrets("AI_COACH_PASSCODE")
@@ -627,7 +706,7 @@ with concept_review:
                                     st.error("Incorrect access code.")
                     if st.session_state.get("ai_unlocked", False):
                         context = {"position": {k: position.get(k) for k in
-                                   ("fen", "stage", "color", "game", "move_number", "theme", "loss_cp")},
+                                   ("fen", "stage", "color", "game", "move_number", "theme", "loss_cp", "confidence", "explanation", "evidence", "question")},
                                    "student_reflection": attempt, "verified_engine_and_board_evidence": deep}
                         model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
                         if pid not in st.session_state.ai_lessons:
@@ -716,6 +795,8 @@ with training:
             st.markdown(f"**Better move:** {selected['best']}")
             st.markdown(f"**Engine continuation:** {selected['principal_variation']}")
             st.markdown(selected["explanation"])
+            st.caption("Diagnostic confidence: " + selected.get("confidence", "Unrated"))
+            st.markdown("**What to ask yourself:** " + selected.get("question", "Which move changes the position most?"))
             url = selected.get("game_url", "")
             if url.startswith("https://"):
                 st.link_button("Open original game", url)
@@ -723,7 +804,7 @@ with training:
 
 with all_positions:
     st.subheader("All analysed mistakes")
-    shown = df[["game", "date", "color", "move_number", "stage", "played", "best", "loss_cp", "theme", "severity"]].copy()
+    shown = df[["game", "date", "color", "move_number", "stage", "played", "best", "loss_cp", "theme", "confidence", "severity", "explanation"]].copy()
     st.dataframe(shown, hide_index=True, use_container_width=True)
     st.download_button("Download findings as CSV", df.to_csv(index=False).encode("utf-8"),
                        file_name="my_chess_patterns.csv", mime="text/csv")

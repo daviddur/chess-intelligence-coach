@@ -16,6 +16,7 @@ import chess.engine
 import chess.pgn
 import requests
 from collector import fetch_chesscom_rapid
+from diagnosis import diagnose
 
 HEADERS = {
     "User-Agent": "ChessPatternCoach/0.1 (educational personal game analysis; contact via app owner)",
@@ -45,6 +46,9 @@ class Finding:
     severity: str
     theme: str
     explanation: str
+    confidence: str
+    evidence: list[str]
+    question: str
 
 
 def fetch_chesscom(username: str, limit: int) -> str:
@@ -165,29 +169,6 @@ def motifs_for_move(board: chess.Board, move: chess.Move) -> list[str]:
     return list(dict.fromkeys(tags))
 
 
-def classify(board: chess.Board, played: chess.Move, best: chess.Move, pv: list[chess.Move],
-             mate_before: bool, mate_after: bool) -> tuple[str, str]:
-    tags = motifs_for_move(board, best)
-    if mate_before and not mate_after:
-        return "Missed forced mates", "The engine found a forced mate before your move, but it was lost after your move."
-    if tags:
-        return "Missed " + tags[0].lower(), "The engine's preferred continuation features " + tags[0].lower() + "."
-    after = board.copy(stack=False)
-    after.push(played)
-    if pv:
-        # Best opponent reply to the actual played move, not to the engine's best move.
-        response = pv[0]
-        if response in after.legal_moves:
-            response_tags = motifs_for_move(after, response)
-            if response_tags:
-                return "Allowed " + response_tags[0].lower(), "Your move allowed an opponent continuation featuring " + response_tags[0].lower() + "."
-            victim = after.piece_at(response.to_square)
-            if victim and victim.color == board.turn and victim.piece_type in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
-                if not after.is_attacked_by(board.turn, response.to_square):
-                    return "Left pieces hanging", "The engine's reply captures one of your undefended pieces."
-    return "Other evaluation losses", "The evaluation dropped, but no tactical motif was confirmed by the first-pass pattern rules."
-
-
 def engine_cp(info: dict, pov: bool) -> int | None:
     score = info.get("score")
     if score is None:
@@ -281,7 +262,8 @@ def scan_games(
                 # Supply the BEFORE-move position, the engine's best move, and
                 # the opponent's response to the actual move for classification.
                 orig = chess.Board(fen)
-                theme, explanation = classify(orig, move, best, actual_response, mate_before, mate_after)
+                diagnosis = diagnose(orig, move, best, best_line, actual_response,
+                                     mate_before, mate_after, curr_phase, motifs_for_move)
                 for tag in tags:
                     motif_missed[tag] += 1
                 severity = "Blunder" if loss >= 300 else "Mistake" if loss >= 170 else "Inaccuracy"
@@ -294,8 +276,10 @@ def scan_games(
                     best=best_san, best_uci=best.uci(),
                     principal_variation=line_to_san(orig, best_line),
                     punishment_line=line_to_san(board, actual_response),
-                    loss_cp=loss, severity=severity, theme=theme,
-                    explanation=explanation,
+                    loss_cp=loss, severity=severity, theme=diagnosis.theme,
+                    explanation=diagnosis.explanation,
+                    confidence=diagnosis.confidence, evidence=diagnosis.evidence,
+                    question=diagnosis.question,
                 ))
             if game_has_player_move:
                 games_used += 1
@@ -304,7 +288,7 @@ def scan_games(
     finally:
         engine.quit()
     return {
-        "games": games_used, "positions": total_positions,
+        "games": games_used, "positions": total_positions, "threshold_cp": threshold_cp,
         "findings": [asdict(f) for f in sorted(results, key=lambda f: f.loss_cp, reverse=True)],
         "motif_events": dict(motif_events), "motif_missed": dict(motif_missed),
     }

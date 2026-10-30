@@ -298,7 +298,7 @@ def teaching_context(game: chess.pgn.Game, turns: list[dict], positions: list[ch
         "student_reflection": reflection,
         "selected_position_engine_only": analysis,
         "screening_findings_in_this_game": [
-            {k: f.get(k) for k in ("move_number", "color", "played", "best", "loss_cp", "theme")}
+            {k: f.get(k) for k in ("move_number", "color", "played", "best", "loss_cp", "theme", "confidence", "explanation")}
             for f in sorted(game_findings, key=lambda f: f.get("move_number", 0))[:15]
         ],
     }
