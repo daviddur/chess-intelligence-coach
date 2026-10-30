@@ -43,11 +43,48 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Palette colours applied to every chess.svg.board() diagram.
+# Changing this setting only changes appearance — not game state or engine analysis.
+BOARD_THEMES = {
+    "Classic Wood": {
+        "square light": "#f0d9b5", "square dark": "#b58863",
+        "square light lastmove": "#f2df83", "square dark lastmove": "#c6a05b",
+        "margin": "#e8decf", "coord": "#47392b",
+    },
+    "Chess.com Green": {
+        "square light": "#eeeed2", "square dark": "#769656",
+        "square light lastmove": "#f5f58c", "square dark lastmove": "#baca44",
+        "margin": "#e2e4d0", "coord": "#3c5630",
+    },
+    "Lichess Green": {
+        "square light": "#ffffdd", "square dark": "#86a666",
+        "square light lastmove": "#f2ef88", "square dark lastmove": "#c3cf66",
+        "margin": "#eef0dc", "coord": "#405b30",
+    },
+    "Slate Blue": {
+        "square light": "#dee3e6", "square dark": "#819aac",
+        "square light lastmove": "#f2e58f", "square dark lastmove": "#a2bba1",
+        "margin": "#d8e0e7", "coord": "#283b49",
+    },
+    "Midnight": {
+        "square light": "#afbacc", "square dark": "#47576b",
+        "square light lastmove": "#e2cb81", "square dark lastmove": "#8f9566",
+        "margin": "#283443", "coord": "#f1f4f8",
+    },
+}
+
 st.markdown('<div class="eyebrow">YOUR GAMES. YOUR BLIND SPOTS.</div>', unsafe_allow_html=True)
 st.title("♞ Chess Intelligence Coach")
 st.caption("Your games → critical decisions → understanding both sides' plans → personalised lessons.")
 
 with st.sidebar:
+    st.header("Board appearance")
+    board_theme = st.selectbox("Chessboard theme", list(BOARD_THEMES), index=0,
+                               help="Applies to whole-game replay, position reviews and tactic practice.")
+    show_board_coordinates = st.checkbox("Show coordinates", value=True)
+    highlight_last_move = st.checkbox("Highlight last move in replay", value=True)
+    board_colors = BOARD_THEMES[board_theme]
+    st.divider()
     st.header("Import your games")
     provider = st.selectbox("Source", ["Chess.com", "Lichess", "PGN upload"])
     username = st.text_input("Your chess username", value="dav4life", help="Used to identify your moves in each game")
@@ -248,8 +285,12 @@ A useful plan might simply be: **improve my worst knight → contest an open fil
                 player_turn = board.turn == player_color
                 left, right = st.columns([1, 1.1], gap="large")
                 with left:
+                    replay_lastmove = (chess.Move.from_uci(turns[ply - 1]["uci"])
+                                       if ply > 0 and highlight_last_move else None)
                     st.image(chess.svg.board(board=board, orientation=player_color,
-                        size=520, coordinates=True), use_container_width=True)
+                        size=520, coordinates=show_board_coordinates,
+                        colors=board_colors, lastmove=replay_lastmove),
+                        use_container_width=True)
                     st.caption(f"After {ply} half-moves · {selected_phase} (approximate) · "
                                f"{'Your' if player_turn else 'Opponent’s'} turn" +
                                (" · Game move sequence finished" if ply == len(turns) else ""))
@@ -456,7 +497,8 @@ with concept_review:
         st.image(chess.svg.board(
             board=b,
             orientation=chess.WHITE if position["color"] == "White" else chess.BLACK,
-            size=490, coordinates=True,
+            size=490, coordinates=show_board_coordinates,
+            colors=board_colors,
         ), use_container_width=True)
         st.caption(f"Position from game {position['game']} · {position['stage']}. Engine answer hidden until your reflection is submitted.")
         with st.expander("Your position-reading checklist", expanded=True):
@@ -644,7 +686,7 @@ with training:
     left, right = st.columns([1.1, 1], gap="large")
     with left:
         drawing = chess.svg.board(board=board, orientation=chess.WHITE if selected["color"] == "White" else chess.BLACK,
-                                  size=460, coordinates=True)
+                                  size=460, coordinates=show_board_coordinates, colors=board_colors)
         st.image(drawing, use_container_width=True)
     with right:
         st.markdown(f"**Game {selected['game']} · {selected['color']} to play · move {selected['move_number']}**")
