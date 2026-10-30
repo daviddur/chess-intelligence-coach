@@ -15,6 +15,10 @@ import streamlit as st
 from analysis import fetch_chesscom, fetch_lichess, parse_games, scan_games
 from coach import position_evidence, prompts_for_stage, reflection_comparison
 from concept_coach import candidate_review, stage_questions, ai_explain
+from game_coach import (replay, chapters, board_lenses, change_after_move,
+                        FOUNDATIONS, engine_checkpoint, ai_game_lesson, teaching_context,
+                        chapter_engine_evidence, ai_full_game_story)
+from analysis import phase
 
 
 def setting_from_secrets(name: str) -> str:
@@ -95,6 +99,10 @@ if go:
                 with st.spinner("Stockfish is evaluating your positions…"):
                     report = scan_games(games, username.strip(), engine_path, think_time, threshold, progress)
                 st.session_state.report = report
+                st.session_state.games_pgn = pgn
+                for cache_key in ("game_coach_reflections", "game_coach_engine",
+                                  "game_coach_lessons", "game_coach_chats", "game_coach_stories"):
+                    st.session_state.pop(cache_key, None)
                 st.session_state.report_username = username.strip()
                 bar.empty()
         except Exception as exc:
@@ -124,7 +132,7 @@ if not findings:
     st.stop()
 
 df = pd.DataFrame(findings)
-summary, concept_review, training, all_positions = st.tabs(["Weakness profile", "Understand a position", "Tactic practice", "All findings"])
+summary, game_walkthrough, concept_review, training, all_positions = st.tabs(["Weakness profile", "Whole-game coach", "Understand a position", "Tactic practice", "All findings"])
 
 with summary:
     st.subheader("Most frequent error categories")
@@ -153,6 +161,256 @@ with summary:
         st.bar_chart(df.groupby("severity").size().rename("Errors"))
     top = counts.index[0]
     st.info(f"**Your most frequent detected category:** {top} ({counts.iloc[0]} occurrences). Start with those training positions.")
+
+with game_walkthrough:
+    st.subheader("Learn the entire game — not just isolated mistakes")
+    st.caption("Move through the game, stop at turning points, and learn what each phase is trying to achieve. The AI tutor uses the full move sequence and board facts; Stockfish checks the selected moment, not every move at once.")
+    with st.expander("Start here: what are you actually trying to achieve in chess?", expanded=True):
+        st.markdown("""**The goal is to create advantages that eventually allow you to attack the king, win material, or promote a pawn.** You do that by giving your pieces useful jobs, controlling important squares, creating targets, and preventing your opponent's plan.
+
+**The five questions before most moves:**
+
+1. **Safety:** What did the last move threaten? Are there checks, captures or undefended pieces?
+2. **Space and squares:** Which central or forward squares would make my pieces stronger? What protects them?
+3. **Pieces:** Which of my pieces has the least useful job? Where could it improve?
+4. **Pawns:** Which pawn moves could open a route or create a weakness, for either side?
+5. **Plan:** What is my 2–3 move objective, and what can the opponent do to stop it?
+
+**Strong square:** a square that gives a piece influence and can be held safely. **Weak square:** a square that is hard to defend or challenge, especially with pawns. **Outpost:** typically an advanced square where a knight is supported and difficult for enemy pawns to dislodge. They are *potential targets*, not automatic commands to move there.
+
+A useful plan might simply be: **improve my worst knight → contest an open file with a rook → attack a weak pawn**. It doesn't have to be a direct king attack.""")
+    raw_games = st.session_state.get("games_pgn", "")
+    if not raw_games:
+        st.info("Please run 'Analyse my games' once after this update. The game archive is stored in this session for the guided replay.")
+    else:
+        replay_games = parse_games(raw_games, 250)
+        player = st.session_state.get("report_username", username).casefold()
+        matching = [(i, game) for i, game in enumerate(replay_games, 1)
+                    if player in (game.headers.get("White", "").casefold(), game.headers.get("Black", "").casefold())]
+        if not matching:
+            st.info("No games matching your username were found in the current session. Please reanalyse.")
+        else:
+            game_numbers = [i for i, _ in matching]
+            by_number = dict(matching)
+            game_number = st.selectbox(
+                "Choose a game", game_numbers,
+                format_func=lambda i: (f"Game {i} · {by_number[i].headers.get('White', '?')} vs "
+                                       f"{by_number[i].headers.get('Black', '?')} · "
+                                       f"{by_number[i].headers.get('Result', '*')} · "
+                                       f"{by_number[i].headers.get('Date', '')}"),
+                key="full_game_choice",
+            )
+            game = by_number[game_number]
+            player_color = game.headers.get("White", "").casefold() == player
+            positions, turns = replay(game)
+            game_findings = [f for f in findings if f["game"] == game_number]
+            landmarks = chapters(positions, turns, player_color, game_findings)
+            replay_key = f"fullgame_ply_{game_number}"
+            if replay_key not in st.session_state:
+                st.session_state[replay_key] = 0 if player_color else min(1, len(turns))
+            def jump_to(k, index):
+                st.session_state[k] = index
+
+            if turns:
+                top_left, top_right = st.columns([2, 1], gap="medium")
+                with top_left:
+                    landmark_index = st.selectbox(
+                        "Jump to a strategic chapter", range(len(landmarks)),
+                        format_func=lambda i: f"{landmarks[i]['title']} · move {(landmarks[i]['ply']//2)+1}",
+                        key=f"landmark_choice_{game_number}",
+                    )
+                with top_right:
+                    st.write(" ")
+                    st.button("Go to chapter", on_click=jump_to,
+                              args=(replay_key, landmarks[landmark_index]["ply"]),
+                              use_container_width=True)
+                p1, p2, p3 = st.columns([1, 1, 3])
+                with p1:
+                    st.button("◀ Previous", key=f"prev_move_{game_number}",
+                              on_click=jump_to,
+                              args=(replay_key, max(0, st.session_state[replay_key]-1)),
+                              disabled=st.session_state[replay_key] == 0, use_container_width=True)
+                with p2:
+                    st.button("Next ▶", key=f"next_move_{game_number}",
+                              on_click=jump_to,
+                              args=(replay_key, min(len(turns), st.session_state[replay_key]+1)),
+                              disabled=st.session_state[replay_key] == len(turns), use_container_width=True)
+                with p3:
+                    st.slider("Walk through every half-move", 0, len(turns), key=replay_key,
+                              help="0 is the starting position, 1 is after White's first move, 2 after Black's first move, etc.")
+
+                ply = st.session_state[replay_key]
+                board = positions[ply]
+                selected_phase = phase(board)
+                chapter = next((c for c in landmarks if c["ply"] == ply), None)
+                if chapter:
+                    st.info(f"**Chapter: {chapter['title']}** — This is a useful moment to reassess your plan.")
+                player_turn = board.turn == player_color
+                left, right = st.columns([1, 1.1], gap="large")
+                with left:
+                    st.image(chess.svg.board(board=board, orientation=player_color,
+                        size=520, coordinates=True), use_container_width=True)
+                    st.caption(f"After {ply} half-moves · {selected_phase} (approximate) · "
+                               f"{'Your' if player_turn else 'Opponent’s'} turn" +
+                               (" · Game move sequence finished" if ply == len(turns) else ""))
+                    previous = turns[max(0, ply-8):ply]
+                    if previous:
+                        st.markdown("**How we arrived here:** " + "  ".join(
+                            f"{t['number']}{'.' if t['color']=='White' else '...'}{t['san']}" for t in previous))
+                    if ply > 0:
+                        with st.expander("What changed on the last move?", expanded=True):
+                            actual = chess.Move.from_uci(turns[ply-1]["uci"])
+                            for observation in change_after_move(positions[ply-1], actual):
+                                st.markdown("• " + observation)
+                    if ply < len(turns):
+                        with st.expander("Reveal what was actually played next", expanded=False):
+                            st.write(f"{turns[ply]['number']}{'.' if board.turn else '...'}{turns[ply]['san']}")
+                            st.caption("This is the historical game move, not necessarily the best move.")
+                with right:
+                    foundation = FOUNDATIONS[selected_phase]
+                    st.markdown(f"### What are we trying to achieve in the {selected_phase.lower()}?")
+                    st.markdown(foundation["goal"])
+                    st.caption(foundation["why"])
+                    st.markdown("**Think before choosing a move:**")
+                    for q in foundation["questions"]:
+                        st.markdown("• " + q)
+                    with st.expander("Learn to read *this* board — both sides", expanded=True):
+                        st.caption("These are board facts and prompts, not proof of a winning strategic plan.")
+                        for observation in board_lenses(board, player_color):
+                            st.markdown(f"**{observation['topic']}:** {observation['fact']}")
+                            st.caption(observation["why"])
+
+                lesson_id = f"{game_number}_{ply}"
+                if "game_coach_reflections" not in st.session_state:
+                    st.session_state.game_coach_reflections = {}
+                if "game_coach_engine" not in st.session_state:
+                    st.session_state.game_coach_engine = {}
+                if "game_coach_lessons" not in st.session_state:
+                    st.session_state.game_coach_lessons = {}
+                if "game_coach_chats" not in st.session_state:
+                    st.session_state.game_coach_chats = {}
+                st.divider()
+                st.markdown("### Your thinking → your coaching")
+                st.caption("Say what you believe is going on. 'I'm not sure' is a useful starting point.")
+                with st.form(f"game_reflection_{lesson_id}"):
+                    last_move_effect = st.text_area("What changed, or what is the opponent threatening?",
+                                                    placeholder="For example, their knight now controls e4. I'm not sure why that matters.", height=70)
+                    target = st.text_area("What squares, pieces or weaknesses matter?",
+                                          placeholder="Which piece needs improving? Which square could you use, and why?", height=70)
+                    prospective_plan = st.text_area("What would your next 2–3 moves try to achieve?",
+                                                    placeholder="I want to..., because...; the opponent may counter with...", height=70)
+                    save_reflection = st.form_submit_button("Save my assessment", use_container_width=True)
+                if save_reflection:
+                    st.session_state.game_coach_reflections[lesson_id] = {
+                        "last_move_effect": last_move_effect.strip() or "Not sure",
+                        "priority_squares": target.strip() or "Not sure",
+                        "candidate_plan": prospective_plan.strip() or "Not sure",
+                    }
+                    st.success("Assessment saved for this position. Now compare it with the evidence.")
+                reflection = st.session_state.game_coach_reflections.get(lesson_id)
+                if reflection:
+                    st.caption("Your recorded plan: " + reflection["candidate_plan"])
+                if lesson_id not in st.session_state.game_coach_engine:
+                    if st.button("Check candidate moves with Stockfish", key=f"g_engine_{lesson_id}"):
+                        try:
+                            with st.spinner("Checking this moment more deeply…"):
+                                st.session_state.game_coach_engine[lesson_id] = engine_checkpoint(
+                                    board.fen(), engine_path, seconds=0.9)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Stockfish couldn't analyse this position: {exc}")
+                if lesson_id in st.session_state.game_coach_engine:
+                    with st.expander("Engine evidence for this moment", expanded=False):
+                        check = st.session_state.game_coach_engine[lesson_id]
+                        for c in check["candidates"]:
+                            st.markdown(f"**{c['move']}** · {c['score']} — {c['variation']}")
+                        st.caption(check["note"])
+
+                api_key = setting_from_secrets("OPENAI_API_KEY")
+                access_code = setting_from_secrets("AI_COACH_PASSCODE")
+                st.markdown("#### Ask your whole-game chess tutor")
+                if not api_key or not access_code:
+                    st.info("To use conversational lessons, add OPENAI_API_KEY and AI_COACH_PASSCODE in Streamlit Secrets. The replay and foundational prompts work without AI.")
+                else:
+                    if not st.session_state.get("ai_unlocked", False):
+                        with st.form("full_game_unlock"):
+                            code = st.text_input("AI coach access passcode", type="password")
+                            if st.form_submit_button("Unlock tutor"):
+                                if hmac.compare_digest(code, access_code):
+                                    st.session_state.ai_unlocked = True
+                                    st.rerun()
+                                else:
+                                    st.error("Incorrect passcode.")
+                    if st.session_state.get("ai_unlocked", False):
+                        context = teaching_context(
+                            game, turns, positions, ply, player_color, reflection,
+                            st.session_state.game_coach_engine.get(lesson_id), game_findings)
+                        model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+                        if "game_coach_stories" not in st.session_state:
+                            st.session_state.game_coach_stories = {}
+                        st.markdown("#### The whole game, explained as a story")
+                        st.caption("One complete review linking the opening, middlegame and ending. It checks a handful of chapter positions more deeply; it is not an engine audit of every move.")
+                        if game_number not in st.session_state.game_coach_stories:
+                            if st.button("Explain the strategy of my entire game", key=f"g_story_{game_number}",
+                                         use_container_width=True):
+                                try:
+                                    with st.spinner("Checking the game's strategic checkpoints…"):
+                                        chapter_evidence = chapter_engine_evidence(
+                                            positions, landmarks, engine_path, player_color, seconds=0.4)
+                                    story_context = dict(context)
+                                    story_context["strategic_chapter_evidence"] = chapter_evidence
+                                    with st.spinner("Building a phase-by-phase chess lesson…"):
+                                        st.session_state.game_coach_stories[game_number] = ai_full_game_story(
+                                            story_context, api_key, model=model)
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error("Whole-game lesson could not be generated: " + str(exc))
+                        else:
+                            with st.expander("Your whole-game strategic lesson", expanded=True):
+                                st.markdown(st.session_state.game_coach_stories[game_number])
+                        st.divider()
+                        st.markdown("#### Explore this position within the story")
+                        if lesson_id not in st.session_state.game_coach_lessons:
+                            if st.button("Teach me the theme and plans at this moment", key=f"g_lesson_{lesson_id}",
+                                         type="primary", use_container_width=True):
+                                try:
+                                    if lesson_id not in st.session_state.game_coach_engine:
+                                        with st.spinner("Grounding the lesson in Stockfish…"):
+                                            st.session_state.game_coach_engine[lesson_id] = engine_checkpoint(
+                                                board.fen(), engine_path, seconds=0.9)
+                                        context["selected_position_engine_only"] = st.session_state.game_coach_engine[lesson_id]
+                                    with st.spinner("Explaining how this fits into the game…"):
+                                        st.session_state.game_coach_lessons[lesson_id] = ai_game_lesson(
+                                            context, api_key, model=model)
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error("Could not generate the lesson: " + str(exc))
+                        if lesson_id in st.session_state.game_coach_lessons:
+                            st.markdown(st.session_state.game_coach_lessons[lesson_id])
+                            history = st.session_state.game_coach_chats.setdefault(lesson_id, [])
+                            for msg in history:
+                                with st.chat_message(msg["role"]):
+                                    st.markdown(msg["content"])
+                            with st.form(f"g_chat_form_{lesson_id}", clear_on_submit=True):
+                                question = st.text_input("Challenge the tutor or ask about a concept",
+                                                         placeholder="Why is d5 an outpost? What changed when the pawns exchanged?")
+                                ask = st.form_submit_button("Ask my coach")
+                            if ask and question.strip():
+                                try:
+                                    with st.spinner("Thinking through the concept…"):
+                                        answer = ai_game_lesson(context, api_key,
+                                                                question=question.strip(), history=history, model=model)
+                                    history.extend([{"role": "user", "content": question.strip()},
+                                                    {"role": "assistant", "content": answer}])
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error("Question failed: " + str(exc))
+                if st.session_state.game_coach_reflections:
+                    st.download_button("Export my strategic reflections",
+                                       json.dumps(st.session_state.game_coach_reflections, indent=2),
+                                       file_name="my_strategic_chess_thinking.json", mime="application/json")
+            else:
+                st.info("No legal moves were found in this game.")
 
 with concept_review:
     st.subheader("Think before you reveal")
