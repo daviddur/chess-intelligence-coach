@@ -5,6 +5,7 @@ import os
 import shutil
 import hashlib
 import json
+import hmac
 
 import chess
 import chess.svg
@@ -13,6 +14,19 @@ import streamlit as st
 
 from analysis import fetch_chesscom, fetch_lichess, parse_games, scan_games
 from coach import position_evidence, prompts_for_stage, reflection_comparison
+from concept_coach import candidate_review, stage_questions, ai_explain
+
+
+def setting_from_secrets(name: str) -> str:
+    # Cloud secrets are mapped into environment variables on Streamlit Cloud.
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(name, ""))
+    except (FileNotFoundError, KeyError):
+        return ""
+
 
 st.set_page_config(page_title="Chess Intelligence Coach", page_icon="♞", layout="wide")
 st.markdown("""
@@ -27,7 +41,7 @@ st.markdown("""
 
 st.markdown('<div class="eyebrow">YOUR GAMES. YOUR BLIND SPOTS.</div>', unsafe_allow_html=True)
 st.title("♞ Chess Intelligence Coach")
-st.caption("Your games → critical positions → position assessment → personalised lessons.")
+st.caption("Your games → critical decisions → understanding both sides' plans → personalised lessons.")
 
 with st.sidebar:
     st.header("Import your games")
@@ -229,32 +243,132 @@ with concept_review:
                         }
                         st.rerun()
         else:
-            st.success("Your thinking was recorded. Now compare it with the position's concrete evidence.")
-            st.markdown(f"**Your priority:** {attempt['priority']}")
-            st.markdown(f"**Your plan:** {attempt['plan']}")
-            st.markdown(f"**Your move:** {attempt['chosen_move']}")
-            if attempt["chosen_uci"] == position["best_uci"]:
-                st.success("You found Stockfish's top candidate at this search setting.")
+            st.success("Your assessment has been recorded. Let's understand the position.")
+            st.markdown("#### Your original thinking")
+            st.write(f"**Priority:** {attempt['priority']}")
+            st.write(f"**Your plan:** {attempt['plan']}")
+            st.write(f"**Opponent's possible threat:** {attempt.get('opponent_threat') or 'Not specified'}")
+            st.write(f"**Your candidate move:** {attempt['chosen_move']}")
+            if "deep_reviews" not in st.session_state:
+                st.session_state.deep_reviews = {}
+            if "ai_lessons" not in st.session_state:
+                st.session_state.ai_lessons = {}
+            if "ai_chats" not in st.session_state:
+                st.session_state.ai_chats = {}
+            if "ai_errors" not in st.session_state:
+                st.session_state.ai_errors = {}
+
+            if pid not in st.session_state.deep_reviews:
+                st.info("Your earlier review used fast screening analysis. The next step searches this particular position more deeply, checks several candidate moves, and extracts learning cues for both sides.")
+                if st.button("Build my positional lesson", type="primary", key=f"deepen_{pid}", use_container_width=True):
+                    try:
+                        with st.spinner("Examining candidate plans with Stockfish…"):
+                            st.session_state.deep_reviews[pid] = candidate_review(
+                                position["fen"], attempt["chosen_uci"], position["played_uci"],
+                                engine_path, seconds=1.0,
+                            )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not complete deeper analysis: {exc}")
             else:
-                st.info("You chose a different move. That doesn't automatically make your plan bad; let's inspect the continuation.")
-            st.markdown("#### Engine comparison")
-            st.markdown(f"**You played in the original game:** {position['played']}")
-            st.markdown(f"**Engine's preferred move:** {position['best']}")
-            st.markdown(f"**Engine's illustrative line:** {position['principal_variation']}")
-            st.markdown(f"**Reply after your original move:** {position.get('punishment_line', '') or 'Not available'}")
-            comparison = reflection_comparison(position["fen"], position["played_uci"], position["best_uci"])
-            st.markdown("**Visible move properties** (not a complete strategic explanation)")
-            st.write("Your original move: " + (", ".join(comparison["played_features"]) or "no simple tactical property detected"))
-            st.write("Engine move: " + (", ".join(comparison["better_features"]) or "no simple tactical property detected"))
-            st.markdown("**Detector's motif hypothesis:** " + position["theme"])
-            st.caption(position["explanation"] + " This label is a heuristic and should be checked against the continuation.")
-            with st.expander("Inspect board-derived position facts", expanded=True):
-                for evidence in position_evidence(b):
-                    st.markdown(f"**{evidence['topic']}:** {evidence['fact']}")
-                    st.caption(evidence["question"])
-            st.markdown("**Reflect:** Which feature did you overlook? What would you check first in a similar position?")
+                deep = st.session_state.deep_reviews[pid]
+                st.markdown("### Read the position, not just the engine")
+                st.caption("Verified board features below are evidence to reason from. Their strategic implications depend on the exact variations.")
+                facts = deep["facts"]
+                key_topics = lambda f: (0 if "Immediate" in f["topic"] else
+                                        1 if "targets" in f["topic"] else
+                                        2 if "pawn structure" in f["topic"] else
+                                        3 if "development" in f["topic"] else
+                                        4 if "Open files" in f["topic"] else 5)
+                for fact in sorted(facts, key=key_topics)[:5]:
+                    st.markdown(f"**{fact['topic']}** — {fact['fact']}")
+                    st.caption(f"Why it matters: {fact['why']}")
+                with st.expander("All verified board features (both sides)"):
+                    for fact in facts:
+                        st.markdown(f"**{fact['topic']}** — {fact['fact']}")
+                        st.caption(f"Why: {fact['why']} · Ask: {fact['question']}")
+
+                st.markdown("#### How to approach this type of position")
+                for n, question in enumerate(stage_questions(position["stage"], facts), 1):
+                    st.markdown(f"{n}. {question}")
+
+                st.markdown("#### Compare your candidate plans")
+                chosen = deep["comparisons"]["chosen"]
+                original = deep["comparisons"]["original"]
+                st.write(f"**Your proposed move {chosen['move']}:** evaluation {chosen['evaluation']} from your perspective; potential reply {chosen['opponent_reply']}.")
+                st.write(f"**Your move in the game {original['move']}:** evaluation {original['evaluation']}; potential reply {original['opponent_reply']}.")
+                st.caption("These estimates come from a deeper but still limited engine search. A score alone does not explain the positional idea.")
+
+                with st.expander("Stockfish's candidate moves and concrete variations", expanded=False):
+                    for alternative in deep["candidates"]:
+                        st.markdown(f"**{alternative['rank']}. {alternative['move']}** ({alternative['evaluation']})")
+                        st.caption(alternative["continuation"])
+                    st.write("After your proposed move: " + chosen["continuation"])
+                    st.write("After your original move: " + original["continuation"])
+                    st.caption("Tactical motif detector: " + position["theme"] + ". " + position["explanation"])
+
+                api_key = setting_from_secrets("OPENAI_API_KEY")
+                access_code = setting_from_secrets("AI_COACH_PASSCODE")
+                st.markdown("### Your conversational chess coach")
+                if not api_key:
+                    st.info("To unlock explanations of the plans and an interactive coaching conversation, add an OpenAI API key to your **Streamlit app's Secrets**. Until then, the board evidence, questions and candidate comparisons still work without AI or charges.")
+                    st.caption("Secret format: OPENAI_API_KEY = \"sk-...\". Never paste the key into GitHub or into this chat.")
+                elif not access_code:
+                    st.warning("This is a publicly accessible app. To prevent strangers using your paid API credits, also add AI_COACH_PASSCODE to your Streamlit Secrets. The AI coach stays disabled until you do.")
+                else:
+                    if not st.session_state.get("ai_unlocked", False):
+                        with st.form("ai_access_form"):
+                            code = st.text_input("Private AI coach access code", type="password")
+                            if st.form_submit_button("Unlock AI coach"):
+                                if hmac.compare_digest(code, access_code):
+                                    st.session_state.ai_unlocked = True
+                                    st.rerun()
+                                else:
+                                    st.error("Incorrect access code.")
+                    if st.session_state.get("ai_unlocked", False):
+                        context = {"position": {k: position.get(k) for k in
+                                   ("fen", "stage", "color", "game", "move_number", "theme", "loss_cp")},
+                                   "student_reflection": attempt, "verified_engine_and_board_evidence": deep}
+                        model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+                        if pid not in st.session_state.ai_lessons:
+                            if st.button("Teach me the plans and principles", key=f"teach_{pid}", type="primary", use_container_width=True):
+                                try:
+                                    with st.spinner("Building a personalised lesson grounded in the position…"):
+                                        st.session_state.ai_lessons[pid] = ai_explain(context, api_key, model=model)
+                                    st.session_state.ai_errors.pop(pid, None)
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.session_state.ai_errors[pid] = str(exc)
+                        if pid in st.session_state.ai_errors:
+                            st.error("AI request failed: " + st.session_state.ai_errors[pid])
+                        if pid in st.session_state.ai_lessons:
+                            st.markdown(st.session_state.ai_lessons[pid])
+                            st.divider()
+                            st.markdown("#### Ask why — and challenge the coach")
+                            chat = st.session_state.ai_chats.setdefault(pid, [])
+                            for turn in chat:
+                                with st.chat_message(turn["role"]):
+                                    st.markdown(turn["content"])
+                            with st.form(f"chat_form_{pid}", clear_on_submit=True):
+                                question = st.text_input("Your follow-up", placeholder="Why is that square weak? What if I exchange queens?")
+                                ask = st.form_submit_button("Ask my coach")
+                            if ask and question.strip():
+                                try:
+                                    with st.spinner("Checking the engine evidence and teaching the concept…"):
+                                        answer = ai_explain(context, api_key, question=question.strip(), history=chat, model=model)
+                                    chat.extend([{"role": "user", "content": question.strip()},
+                                                 {"role": "assistant", "content": answer}])
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error("Follow-up failed: " + str(exc))
+                        st.caption("AI-generated interpretations can be wrong. Check critical claims against the engine variations; no account data or keys are needed for the Stockfish analysis itself.")
+
             if st.button("Try this position again", key=f"retry_{pid}"):
                 st.session_state.coach_attempts.pop(pid, None)
+                st.session_state.deep_reviews.pop(pid, None)
+                st.session_state.ai_lessons.pop(pid, None)
+                st.session_state.ai_chats.pop(pid, None)
+                st.session_state.ai_errors.pop(pid, None)
                 st.rerun()
     if st.session_state.coach_attempts:
         st.download_button("Export my reasoning as JSON",
